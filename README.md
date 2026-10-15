@@ -202,6 +202,8 @@ POPUP_GRACE = 6.0
 
 POPUP_CLOSE = 0.6
 
+POPUP_AFTER = 1.2
+
 LOSS_UNDO = 12.0
 
 PRIZE_WINDOW = 25.0
@@ -997,7 +999,7 @@ CHOICE_ASPECT = (0.30, 3.0)
 CHOICE_ROW = (2, 8)
 
 
-def choice_row(frame, margin=0):
+def choice_panel(frame, margin=0):
     if frame is None or frame.size == 0:
         return None
     view, ox, oy = _crop_margin(frame, margin)
@@ -1007,7 +1009,8 @@ def choice_row(frame, margin=0):
         px, py, pw, ph = panel
         if pw > vw * 0.92 and ph > vh * 0.92:
             continue
-        if _band_above(view, panel) is None:
+        band = _band_above(view, panel)
+        if band is None:
             continue
         picks = _pictures_in(view, panel)
         if not (CHOICE_ROW[0] <= len(picks) <= CHOICE_ROW[1]):
@@ -1015,8 +1018,174 @@ def choice_row(frame, margin=0):
         rows = group_rows(picks)
         if len(rows) != 1:
             continue
-        return [(b[0] + ox, b[1] + oy, b[2], b[3]) for b in rows[0]]
+        boxes = [(b[0] + ox, b[1] + oy, b[2], b[3]) for b in rows[0]]
+        return {"panel": (px + ox, py + oy, pw, ph), "band": band,
+                "boxes": boxes}
     return None
+
+
+def choice_row(frame, margin=0):
+    parts = choice_panel(frame, margin)
+    return parts["boxes"] if parts else None
+
+
+def popup_showing(frame, margin=0):
+    if choice_row(frame, margin):
+        return True
+    if frame is None or frame.size == 0:
+        return False
+    view, _ox, _oy = _crop_margin(frame, margin)
+    vh, vw = view.shape[:2]
+    for _area, panel in _pale_panels(view):
+        px, py, pw, ph = panel
+        if pw > vw * 0.92 and ph > vh * 0.92:
+            continue
+        mid = (px + pw / 2.0) / vw
+        if not (0.3 <= mid <= 0.7) or pw < vw * 0.12:
+            continue
+        if _band_above(view, panel) is None:
+            continue
+        if _pictures_in(view, panel):
+            return True
+    return False
+
+
+ICON_BAND_TOL = 45
+ICON_EDGE_TOL = 55
+ICON_SURE = 0.10
+ICON_LEAD = 1.8
+ICON_SURE_LOW = 0.04
+ICON_LEAD_LOW = 4.0
+
+
+def popup_outline(frame, parts):
+    px, py, pw, ph = parts["panel"]
+    band = parts["band"]
+    fh, fw = frame.shape[:2]
+    x0, x1 = max(0, px - pw // 4), min(fw, px + pw + pw // 4)
+    y0 = max(0, py - int(ph * 3))
+    if py - y0 < 6:
+        return None
+    region = frame[y0:py, x0:x1].astype(np.float32)
+    near = (np.linalg.norm(region - band, axis=2) < ICON_BAND_TOL)
+    near = cv2.morphologyEx(near.astype(np.uint8), cv2.MORPH_CLOSE,
+                            np.ones((9, 9), np.uint8))
+    _n, lab, st, _c = cv2.connectedComponentsWithStats(near, 8)
+    seed = lab[max(0, near.shape[0] - 3), min(near.shape[1] - 1,
+                                               px + pw // 2 - x0)]
+    if seed == 0:
+        return None
+    bx, by, bw, _bh, _a = st[seed]
+    return x0 + bx, y0 + by, bw, py - (y0 + by)
+
+
+def popup_icon(frame, parts):
+    box = popup_outline(frame, parts)
+    if box is None:
+        return None
+    x, y, w, h = box
+    rw, rh = int(w * 0.25), int(h * 0.42)
+    if rw < 10 or rh < 10:
+        return None
+    region = frame[y:y + rh, x:x + rw]
+    far = np.linalg.norm(region.astype(np.float32) - parts["band"], axis=2)
+    green = (far < ICON_BAND_TOL).astype(np.uint8)
+    n, lab, st, _c = cv2.connectedComponentsWithStats(green, 8)
+    if n < 2:
+        return None
+    biggest = 1 + int(np.argmax(st[1:, 4]))
+    shape = (lab == biggest).astype(np.uint8)
+    contours, _h = cv2.findContours(shape, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+    inside = np.zeros_like(shape)
+    cv2.drawContours(inside, contours, -1, 1, -1)
+    diff = ((far > ICON_EDGE_TOL) & (inside > 0)).astype(np.uint8)
+    diff = cv2.morphologyEx(diff, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    diff &= inside
+    n, lab, st, _c = cv2.connectedComponentsWithStats(diff, 8)
+    best = None
+    for i in range(1, n):
+        bx, by, bw, bh, a = st[i]
+        if a < 30 or bw < 6 or bh < 6 or bx > rw * 0.6:
+            continue
+        if best is None or a > best[0]:
+            best = (a, i, (bx, by, bw, bh))
+    if best is None:
+        return None
+    _k, i, (bx, by, bw, bh) = best
+    img = region[by:by + bh, bx:bx + bw]
+    mask = (lab[by:by + bh, bx:bx + bw] == i).astype(np.uint8)
+    edge = np.linalg.norm(img.astype(np.float32) - parts["band"], axis=2) \
+        > ICON_EDGE_TOL
+    mask = (mask.astype(bool) & edge).astype(np.uint8)
+    return img, mask, (x + bx, y + by, bw, bh)
+
+
+def _drop_shadow(img, mask):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    grey = (hsv[..., 1] < 40) & (hsv[..., 2] > 90) & (hsv[..., 2] < 200)
+    out = mask.copy()
+    top = int(out.shape[0] * 0.6)
+    out[top:][grey[top:]] = 0
+    return out
+
+
+def _shape_of(img, mask, size=(24, 32)):
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 10:
+        return None
+    img = img[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    mask = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    lab = cv2.cvtColor(cv2.resize(img, size, interpolation=cv2.INTER_AREA),
+                       cv2.COLOR_BGR2LAB).astype(np.float32)
+    small = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST) > 0
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], mask * 255, [18, 8], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, 1, 0, cv2.NORM_L1)
+    return lab, small, img.shape[1] / float(img.shape[0]), hist
+
+
+def _shapes_alike(a, b):
+    la, ma, ra, ha = a
+    lb, mb, rb, hb = b
+    both = ma & mb
+    if both.sum() < 20:
+        return 0.0
+    overlap = both.sum() / float((ma | mb).sum())
+    colour = float((np.linalg.norm(la - lb, axis=2)[both] < 28).mean())
+    aspect = min(ra, rb) / max(ra, rb)
+    hues = max(0.0, cv2.compareHist(ha, hb, cv2.HISTCMP_CORREL))
+    return colour * overlap ** 0.5 * aspect ** 0.5 * (0.5 + 0.5 * hues)
+
+
+def answer_by_icon(frame, parts):
+    icon = popup_icon(frame, parts)
+    if icon is None:
+        return None, []
+    want = _shape_of(icon[0], icon[1])
+    if want is None:
+        return None, []
+    px, py, pw, ph = parts["panel"]
+    inner = frame[py + 4:py + ph - 4, px + 4:px + pw - 4]
+    cream = np.median(inner.reshape(-1, 3).astype(np.float32), axis=0)
+    scored = []
+    for box in parts["boxes"]:
+        bx, by, bw, bh = box[:4]
+        crop = frame[by:by + bh, bx:bx + bw]
+        mask = (np.linalg.norm(crop.astype(np.float32) - cream, axis=2)
+                > 40).astype(np.uint8)
+        got = _shape_of(crop, _drop_shadow(crop, mask))
+        scored.append((_shapes_alike(want, got) if got else 0.0, box))
+    scored.sort(key=lambda p: -p[0])
+    if not scored:
+        return None, scored
+    top = scored[0][0]
+    nxt = scored[1][0] if len(scored) > 1 else 0.0
+    if top >= ICON_SURE and top >= nxt * ICON_LEAD:
+        return scored[0][1], scored
+    if top >= ICON_SURE_LOW and top >= nxt * ICON_LEAD_LOW:
+        return scored[0][1], scored
+    return None, scored
 
 
 def _pale_panels(view):
@@ -2286,6 +2455,8 @@ class ItemGrabber:
         self.vanished = []
         self.spawns = SpawnMap()
         self.popup_open = False
+        self.popup_closed_at = 0.0
+        self.popup_parts = None
         self.popup_missing = None
         self.popup_item = None
         self.recent_loss = None
@@ -4800,7 +4971,9 @@ class ItemGrabber:
                 self.update_me(frame)
                 self.stage("finding you")
 
-                boxes = choice_row(frame, margin=self.margin)
+                parts = choice_panel(frame, margin=self.margin)
+                self.popup_parts = parts
+                boxes = parts["boxes"] if parts else None
                 self.stage("popup check")
                 if boxes:
                     self.popup_missing = None
@@ -5050,6 +5223,7 @@ class ItemGrabber:
     def popup_gone(self):
         self.popup_open = False
         self.popup_since = None
+        self.popup_closed_at = time.monotonic()
         st, self.prize_state = self.prize_state, None
         claimed = bool(st and st["clicks"] and self.auto_click
                        and not st["gave_up"])
@@ -5074,6 +5248,23 @@ class ItemGrabber:
             now = time.monotonic()
             self.home_plan = [now + d for d in HOME_CLICKS]
         self.ui(self.render_items)
+
+    def popup_quiet(self):
+        return time.monotonic() - self.popup_closed_at >= POPUP_AFTER
+
+    def name_choice(self, frame, box):
+        best, best_t = -1.0, None
+        for t in self.templates:
+            _pick, scored = identify(frame, t.prize or t, [box], -1.0, lead=0)
+            if scored and scored[0][0] > best:
+                best, best_t = scored[0][0], t
+        if best_t is not None and best >= self.prize_score * PRIZE_RELAX:
+            return best_t
+        if self.awaiting is not None:
+            return self.awaiting[0]
+        if self.popup_item is not None:
+            return self.popup_item
+        return best_t
 
     def on_popup(self, frame, boxes):
         self.hits = []
@@ -5109,10 +5300,13 @@ class ItemGrabber:
                             "up \u2014 left for you." % (nice(st["template"].name),
                                                         st["clicks"]), C.RED)
                 return
-            pick, scored = identify(frame, st["template"].prize
-                                    or st["template"], boxes,
-                                    self.prize_score * PRIZE_RELAX,
-                                    lead=PRIZE_RELAX_LEAD)
+            if st.get("by_icon") and self.popup_parts:
+                pick, scored = answer_by_icon(frame, self.popup_parts)
+            else:
+                pick, scored = identify(frame, st["template"].prize
+                                        or st["template"], boxes,
+                                        self.prize_score * PRIZE_RELAX,
+                                        lead=PRIZE_RELAX_LEAD)
             point = st["point"]
             if pick is not None:
                 x, y, w, h = pick[:4]
@@ -5122,7 +5316,32 @@ class ItemGrabber:
 
         st["tries"] += 1
         strict = st["tries"] <= PRIZE_TRIES
+        icon_pick, icon_scored = answer_by_icon(frame, self.popup_parts) \
+            if self.popup_parts else (None, [])
+        if icon_pick is not None:
+            template = self.name_choice(frame, icon_pick)
+            if template is not None:
+                x, y, w, h = icon_pick[:4]
+                if st["gave_up"]:
+                    st["gave_up"] = False
+                    self.unclaimed = max(0, self.unclaimed - 1)
+                st["by_icon"] = True
+                self.click_prize(st, template, (int(x + w / 2), int(y + h / 2)),
+                                 why="matched the popup's own picture",
+                                 scored=icon_scored)
+                return
         choice = self.choose_prize(frame, boxes, strict)
+        if choice is not None and icon_scored and \
+                icon_scored[0][0] >= ICON_SURE * 0.5:
+            mine = next((sc for sc, b in icon_scored
+                         if tuple(b[:4]) == tuple(choice[2][:4])), 0.0)
+            if mine < icon_scored[0][0] * 0.5:
+                if st["tries"] <= 3 * PRIZE_TRIES:
+                    self.status("The popup's picture does not look like the "
+                                "%s \u2014 looking again (look %d)..."
+                                % (nice(choice[0].name), st["tries"]), C.INK_2)
+                    return
+                choice = None
         if choice is None:
             if strict:
                 self.status("Working out which picture it is (look %d)..."
@@ -5252,8 +5471,10 @@ class ItemGrabber:
                         % nice(template.name), C.INK_2)
             self.home_plan = []
             return
+        if not self.popup_quiet():
+            return
         fresh = self.next_frame()
-        if fresh is not None and choice_row(fresh, margin=self.margin):
+        if fresh is not None and popup_showing(fresh, margin=self.margin):
             self.home_plan = []
             return
         debug("click %d,%d  heading back to the %s spot" % (x, y, template.name))
@@ -5377,8 +5598,12 @@ class ItemGrabber:
             return
         if self.holding_for_lag():
             return
+        if not self.popup_quiet():
+            self.status("Prize popup just closed \u2014 holding the click.",
+                        C.INK_2)
+            return
         fresh = self.next_frame()
-        if fresh is not None and choice_row(fresh, margin=self.margin):
+        if fresh is not None and popup_showing(fresh, margin=self.margin):
             self.status("Popup opened just now \u2014 holding the click.",
                         C.INK_2)
             return
