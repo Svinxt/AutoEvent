@@ -148,6 +148,36 @@ BACKUP_PATH = os.path.join(_HERE, "item_config.previous.json")
 DEBUG_IMAGE = os.path.join(_HERE, "item_debug.png")
 STATS_PATH = os.path.join(_HERE, "item_stats.json")
 ITEM_DIR = os.path.join(_HERE, "items")
+CLICK_SPOTS = os.path.join(ITEM_DIR, "click_spots.json")
+
+
+def load_click_spots():
+    try:
+        with open(CLICK_SPOTS, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    if isinstance(data, dict):
+        for name, xy in data.items():
+            try:
+                out[str(name)] = (float(xy[0]), float(xy[1]))
+            except (TypeError, ValueError, IndexError):
+                pass
+    return out
+
+
+def save_click_spot(name, xy):
+    spots = load_click_spots()
+    if xy is None:
+        spots.pop(name, None)
+    else:
+        spots[name] = (round(float(xy[0]), 1), round(float(xy[1]), 1))
+    os.makedirs(ITEM_DIR, exist_ok=True)
+    tmp = CLICK_SPOTS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({k: list(v) for k, v in sorted(spots.items())}, f, indent=1)
+    os.replace(tmp, CLICK_SPOTS)
 REMOVED_DIR = os.path.join(ITEM_DIR, "removed")
 
 BUTTONS = {
@@ -414,6 +444,7 @@ class Template:
         self.image = image
         self.mask = mask
         self.click = (float(click[0]), float(click[1]))
+        self.auto_click = None
         self.enabled = enabled
         self.rank = 0
         self.prize = None
@@ -1338,6 +1369,10 @@ def gather_templates():
             log("items/%s loaded" % entry, key="load:" + stem, every=0)
         except Exception as e:
             log("items/%s could not be read: %s" % (entry, e))
+    for name, xy in load_click_spots().items():
+        if name in out:
+            out[name].auto_click = out[name].click
+            out[name].click = xy
     return [out[k] for k in sorted(out)]
 
 
@@ -3904,19 +3939,76 @@ class ItemGrabber:
 
     def show_picture(self, template):
         win = self.dialog(nice(template.name))
-        sheet = self.item_sheet(template.image, template.mask, template.click)
-        photo = self.photo_of(sheet, self.zoom_for(template.image))
-        tk.Label(win, image=photo, bg=C.SURFACE).pack(padx=16, pady=(16, 8))
+        h, w = template.image.shape[:2]
+        below = int(round(h * 0.6))
+        zoom = self.zoom_for(np.zeros((h + below, w, 3), np.uint8))
+
+        def sheet():
+            image = cv2.copyMakeBorder(template.image, 0, below, 0, 0,
+                                       cv2.BORDER_CONSTANT,
+                                       value=_bgr(C.SUNK))
+            mask = cv2.copyMakeBorder(template.mask, 0, below, 0, 0,
+                                      cv2.BORDER_CONSTANT, value=0)
+            out = self.item_sheet(image, mask, template.click)
+            x, y = int(round(template.click[0])), int(round(template.click[1]))
+            if 0 <= y < out.shape[0] and 0 <= x < w:
+                cv2.drawMarker(out, (w + 4 + x, y), _bgr(C.RED),
+                               cv2.MARKER_CROSS, max(5, w // 6), 1)
+            return out
+
+        label = tk.Label(win, bg=C.SURFACE, cursor="crosshair")
+        label.pack(padx=16, pady=(16, 8))
+
+        def draw():
+            label.configure(image=self.photo_of(sheet(), zoom))
+
+        def place(event):
+            x = event.x / float(zoom) - (w + 4)
+            y = event.y / float(zoom)
+            if not (0 <= x < w and 0 <= y < h + below):
+                return
+            if getattr(template, "auto_click", None) is None:
+                template.auto_click = template.click
+            template.click = (round(x, 1), round(y, 1))
+            try:
+                save_click_spot(template.name, template.click)
+            except Exception as e:
+                self.status("Could not save the click spot: %s" % e, C.RED)
+                return
+            self.status("The %s is now clicked where you put the cross."
+                        % nice(template.name), C.GOOD)
+            draw()
+
+        def automatic():
+            auto = getattr(template, "auto_click", None)
+            if auto is not None:
+                template.click = auto
+            try:
+                save_click_spot(template.name, None)
+            except Exception:
+                pass
+            self.status("The %s is clicked at its automatic spot again."
+                        % nice(template.name), C.INK_2)
+            draw()
+
+        label.bind("<Button-1>", place)
+        draw()
         lines = ["Left: the picture it looks for.  Right: the part that "
-                 "counts (green) and where it clicks (red)."]
+                 "counts (green) and where it clicks (red).",
+                 "Click the right picture to move where it clicks \u2014 "
+                 "for an item that floats, put it on its shadow."]
         if template.prize is not None:
             lines.append("It has its own picture for the prize popup too.")
         tk.Label(win, text="\n".join(lines), bg=C.SURFACE, fg=C.INK_2,
                  font=self.font(9.5), justify="left",
                  wraplength=int(s(320))).pack(padx=16)
-        tk.Button(win, text="Close", command=win.destroy, bg=C.SURFACE_2,
-                  fg=C.INK, activebackground=C.SURFACE_3, relief="flat",
-                  font=self.font(10), padx=14).pack(pady=12)
+        buttons = tk.Frame(win, bg=C.SURFACE)
+        buttons.pack(pady=12)
+        for text_, cmd in (("Automatic spot", automatic),
+                           ("Close", win.destroy)):
+            tk.Button(buttons, text=text_, command=cmd, bg=C.SURFACE_2,
+                      fg=C.INK, activebackground=C.SURFACE_3, relief="flat",
+                      font=self.font(10), padx=14).pack(side="left", padx=4)
         win.bind("<Escape>", lambda e: win.destroy())
 
     def confirm_new_item(self, image, mask, click, suggested=""):
