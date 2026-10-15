@@ -1,4 +1,3 @@
-# AutoEvent
 import base64
 import ctypes
 import json
@@ -121,6 +120,8 @@ _gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
 _gdi32.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
                              ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p,
                              ctypes.c_uint]
+_gdi32.SetLayout.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+_gdi32.SetLayout.restype = ctypes.c_uint32
 
 try:
     _user32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
@@ -2241,6 +2242,7 @@ class ItemGrabber:
         self._sct_local = threading.local()
         self._cap_lock = threading.Lock()
         self._pw = None
+        self._mirror = {}
         self.live_at = 0.0
         self.new_frame = threading.Event()
         self.looks_counted = 0
@@ -4245,6 +4247,8 @@ class ItemGrabber:
             if pw is None or pw["size"] != (ww, wh) or pw["hwnd"] != hwnd:
                 self.free_capture()
                 hdc_mem = _gdi32.CreateCompatibleDC(hdc_src)
+                if hdc_mem:
+                    _gdi32.SetLayout(hdc_mem, 0)
                 hbm = _gdi32.CreateCompatibleBitmap(hdc_src, ww, wh)
                 if not hdc_mem or not hbm:
                     if hbm:
@@ -4336,6 +4340,8 @@ class ItemGrabber:
                     ox, oy = self.client_origin_offset(hwnd)
                 except Exception:
                     ox = oy = 0
+                if self.window_mirrored(hwnd, shot, ox, oy, w, h):
+                    shot = shot[:, ::-1]
                 crop = shot[oy:oy + h, ox:ox + w]
                 if crop.size and crop.shape[0] == h and crop.shape[1] == w \
                         and int(crop.max()) > 8:
@@ -4345,6 +4351,41 @@ class ItemGrabber:
         else:
             self.capture_used = "screen"
         return self.screen_grab(hwnd, 0, 0, w, h)
+
+    def window_mirrored(self, hwnd, shot, ox, oy, w, h):
+        state = self._mirror.get(hwnd)
+        if state is None:
+            state = self._mirror[hwnd] = {"flip": False, "sure": False,
+                                          "checked": 0.0}
+        now = time.monotonic()
+        if state["sure"] or now - state["checked"] < 3.0:
+            return state["flip"]
+        state["checked"] = now
+        screen = self.screen_grab(hwnd, 0, 0, w, h)
+        if screen is None or screen.shape[:2] != (h, w):
+            return state["flip"]
+
+        def small(img):
+            img = cv2.resize(img, (160, 90), interpolation=cv2.INTER_AREA)
+            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+        def alike(a, b):
+            return float(cv2.matchTemplate(a, b, cv2.TM_CCOEFF_NORMED)[0, 0])
+
+        seen = small(screen)
+        straight = alike(seen, small(shot[oy:oy + h, ox:ox + w]))
+        turned = alike(seen, small(shot[:, ::-1][oy:oy + h, ox:ox + w]))
+        best = max(straight, turned)
+        if best < 0.6 or abs(straight - turned) < 0.15:
+            return state["flip"]
+        flip = turned > straight
+        state["sure"] = True
+        if flip != state["flip"] or flip:
+            log("PrintWindow picture is %s (straight %.2f, flipped %.2f)"
+                % ("mirrored, turning it round" if flip else "the right way",
+                   straight, turned))
+        state["flip"] = flip
+        return flip
 
     def toggle_armed(self):
         if self.armed.is_set():
